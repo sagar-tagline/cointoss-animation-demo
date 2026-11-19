@@ -19,6 +19,40 @@
   }
 }
 
+/* Round timer fonts, from the game's own resources (cocos_download). */
+@font-face {
+  font-family: "MyriadPro-Bold";
+  src: url("/fonts/MyriadPro-Bold.ttf") format("truetype");
+  font-display: block;
+}
+
+@font-face {
+  font-family: "NotoSans-Bold";
+  src: url("/fonts/NotoSans-Bold.ttf") format("truetype");
+  font-display: block;
+}
+
+@keyframes new-round-coin {
+  0% {
+    transform: translate(-50%, -50%) scale(0.85) rotateY(180deg);
+    opacity: 0;
+  }
+  6% {
+    opacity: 1;
+  }
+  35% {
+    transform: translate(-50%, -50%) scale(1) rotateY(360deg);
+  }
+  70% {
+    transform: translate(-50%, -50%) scale(1) rotateY(360deg);
+    opacity: 1;
+  }
+  100% {
+    transform: translate(calc(-50% + 300px), -50%) scale(1) rotateY(450deg);
+    opacity: 0;
+  }
+}
+
 body {
   background: #120c08;
   color: #f6e7c1;

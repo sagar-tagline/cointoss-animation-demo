@@ -1,9 +1,24 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import { delays } from "@/round";
+import { layout as fixedLayout } from "@/result";
 
-const WIDTH = 828;
-const HEIGHT = 420;
+// Framing of the live game (720x1280 portrait design). The coin animation is
+// the top strip of the screen: the skeleton node sits at the top edge, 400 px
+// left of centre, scale 1.15. For 1 coin a 720x344 Mask clips it; for 4 coins
+// the bet table covers everything below the same 344 px.
+export const VIEW_WIDTH = 720;
+export const VIEW_HEIGHT = 344;
+const NODE = { x: -400, y: 0, scale: 1.15 };
+
+// 1 coin: cc.Animation clip "zoomIn1Coin" on that node (0.5 s, linear).
+// Played forward on the spine event "zoom in" of reveal_1coin, and in reverse
+// when cover_1coin starts (ct_base_ske_1coin).
+const ZOOMED = { x: -695.6521739, y: 80, scale: 2 };
+const ZOOM_SECONDS = 0.5;
+
+const LAYOUTS = 5;
 
 function restPose(spine) {
   spine.state.clearTracks();
@@ -12,32 +27,27 @@ function restPose(spine) {
   spine.update(0);
 }
 
-// Shaking does not key the bowl, plate, or camera hand. Those stay wherever the
-// previous clip left them. The loop always enters shaking from the end of camup,
-// so the first play has to be seeded with that same pose or the bowl sits on the
-// bind position until camDown snaps it into place.
-function seedPose(spine, name, mixBlend, mixDirection) {
-  const animation = spine.skeleton.data.findAnimation(name);
-  if (!animation) return;
-  spine.skeleton.setToSetupPose();
-  animation.apply(spine.skeleton, 0, animation.duration, false, [], 1, mixBlend, mixDirection);
-  spine.skeleton.updateWorldTransform();
+// ui_manager.playSpineAnimation in the game: no mixing, no pose reset.
+function play(spine, name, loop = false) {
+  spine.state.setAnimation(0, name, loop);
 }
 
-function playOnce(spine, name) {
-  return new Promise((resolve) => {
-    spine.state.clearListeners();
-    const entry = spine.state.setAnimation(0, name, false);
-    if (!entry) {
-      resolve();
-      return;
-    }
-    spine.state.addListener({
-      complete: (track) => {
-        if (track.animation && track.animation.name === name) resolve();
-      },
-    });
-  });
+// Cocos y points up and the node is placed relative to the strip's top centre.
+function placeNode(root, node) {
+  root.position.set(VIEW_WIDTH / 2 + node.x, -node.y);
+  root.scale.set(node.scale);
+}
+
+function lerp(from, to, t) {
+  return from + (to - from) * t;
+}
+
+function pickLayout() {
+  if (Number.isInteger(fixedLayout) && fixedLayout >= 1 && fixedLayout <= LAYOUTS) {
+    return fixedLayout;
+  }
+  // Server value n is random; the game plays result_(1 + n % 5).
+  return 1 + Math.floor(Math.random() * LAYOUTS);
 }
 
 function giveIsInteractive(object) {
@@ -106,7 +116,7 @@ async function loadSpine() {
     new spine37.AtlasAttachmentLoader(atlas)
   );
   const spineData = parser.readSkeletonData(skeletonJson);
-  return { PIXI, spine37, spineData, base };
+  return { PIXI, spine37, spineData };
 }
 
 const ONE_COIN_SLOTS = ["red_result6"];
@@ -156,19 +166,32 @@ function whenReady(texture) {
   });
 }
 
-export default function BowlAnim({ mode, result }) {
+export default function BowlAnim({ mode, result, clock, onReady }) {
   const hostRef = useRef(null);
   const [error, setError] = useState("");
+  const onReadyRef = useRef(onReady);
+  onReadyRef.current = onReady;
 
   useEffect(() => {
     const host = hostRef.current;
-    if (!host) return undefined;
+    if (!host || !clock) return undefined;
     let alive = true;
     let app = null;
+    const timeouts = new Set();
+    const unsubscribe = [];
+
+    // wait_and_excute in the game: plain setTimeout chains.
+    const later = (ms, fn) => {
+      const id = setTimeout(() => {
+        timeouts.delete(id);
+        if (alive) fn();
+      }, ms);
+      timeouts.add(id);
+    };
 
     (async () => {
       try {
-        const { PIXI, spine37, spineData, base } = await loadSpine();
+        const { PIXI, spine37, spineData } = await loadSpine();
         if (!alive) return;
         const textures = {
           head: PIXI.Texture.from("/coins/head.png?v=2"),
@@ -180,8 +203,8 @@ export default function BowlAnim({ mode, result }) {
         const paint = (spine) => paintCoins(spine, faces, textures);
 
         app = new PIXI.Application({
-          width: WIDTH,
-          height: HEIGHT,
+          width: VIEW_WIDTH,
+          height: VIEW_HEIGHT,
           backgroundAlpha: 0,
           antialias: true,
           resolution: Math.min(window.devicePixelRatio || 1, 2),
@@ -196,21 +219,25 @@ export default function BowlAnim({ mode, result }) {
         });
         host.appendChild(app.view);
         app.view.style.width = "100%";
-        app.view.style.height = "auto";
+        app.view.style.height = "100%";
         app.view.style.display = "block";
         app.view.style.pointerEvents = "none";
         silencePointerEvents(app);
         app.stage.eventMode = "none";
         app.stage.interactiveChildren = false;
 
+        // The Cocos node (ct_anim / xocdia_anim). Both skeletons share it.
         const root = new PIXI.Container();
         root.eventMode = "none";
         root.interactiveChildren = false;
         app.stage.addChild(root);
+        placeNode(root, NODE);
 
         const body = new spine37.Spine(spineData);
         root.addChild(body);
 
+        // 4 coins: second skeleton for the hand that lifts and puts back the
+        // bowl lid (xocdia_coveranim). Hidden until the reveal.
         let hand = null;
         if (mode === 4) {
           hand = new spine37.Spine(spineData);
@@ -218,31 +245,57 @@ export default function BowlAnim({ mode, result }) {
           root.addChild(hand);
         }
 
-        body.eventMode = "none";
-        body.interactiveChildren = false;
-        if (hand) {
-          hand.eventMode = "none";
-          hand.interactiveChildren = false;
+        for (const spine of [body, hand]) {
+          if (!spine) continue;
+          spine.eventMode = "none";
+          spine.interactiveChildren = false;
+          spine.autoUpdate = false;
         }
-        body.autoUpdate = false;
-        if (hand) hand.autoUpdate = false;
-        body.scale.set(1.15);
-        if (hand) hand.scale.set(1.15);
-        app.view.style.visibility = "hidden";
 
+        // Room entry: setup pose, then the idle loop.
         restPose(body);
-        const bounds = body.getBounds();
-        const scale = Math.min(
-          (WIDTH - 16) / bounds.width,
-          (HEIGHT - 16) / bounds.height
-        );
-        root.scale.set(scale);
-        root.x = WIDTH / 2 - (bounds.x + bounds.width / 2) * scale;
-        root.y = HEIGHT / 2 - (bounds.y + bounds.height / 2) * scale;
-
-        if (mode === 4) seedPose(body, "camup", base.MixBlend.setup, base.MixDirection.mixIn);
         if (hand) restPose(hand);
-        body.state.setAnimation(0, mode === 4 ? "shaking" : "shaking_1coin", false);
+        play(body, mode === 4 ? "idle" : "idle_1coin", true);
+
+        // 1 coin zoom.
+        const zoom = { from: 0, to: 0, elapsed: ZOOM_SECONDS };
+        const startZoom = (forward) => {
+          zoom.from = forward ? 0 : 1;
+          zoom.to = forward ? 1 : 0;
+          zoom.elapsed = 0;
+        };
+        if (mode === 1) {
+          body.state.addListener({
+            event: (entry, event) => {
+              if (
+                entry.animation &&
+                entry.animation.name === "reveal_1coin" &&
+                event.data.name === "zoom in"
+              ) {
+                startZoom(true);
+              }
+            },
+            start: (entry) => {
+              if (entry.animation && entry.animation.name === "cover_1coin") {
+                startZoom(false);
+              }
+            },
+          });
+          app.ticker.add(() => {
+            if (zoom.elapsed >= ZOOM_SECONDS) return;
+            zoom.elapsed = Math.min(
+              ZOOM_SECONDS,
+              zoom.elapsed + app.ticker.deltaMS / 1000
+            );
+            const t = lerp(zoom.from, zoom.to, zoom.elapsed / ZOOM_SECONDS);
+            placeNode(root, {
+              x: lerp(NODE.x, ZOOMED.x, t),
+              y: lerp(NODE.y, ZOOMED.y, t),
+              scale: lerp(NODE.scale, ZOOMED.scale, t),
+            });
+          });
+        }
+
         followUpdate(body, paint);
         if (hand) followUpdate(hand, paint);
         body.update(0);
@@ -250,31 +303,52 @@ export default function BowlAnim({ mode, result }) {
         if (hand) hand.autoUpdate = true;
         giveTree(app.stage);
         silencePointerEvents(app);
-        app.view.style.visibility = "visible";
 
-        while (alive) {
-          if (mode === 4) {
-            await playOnce(body, "shaking");
-            if (!alive) return;
-            await playOnce(body, "camDown");
-            if (!alive) return;
-            hand.visible = true;
-            restPose(hand);
-            const reveal = playOnce(hand, "reveal");
-            await Promise.all([playOnce(body, "result_1"), reveal]);
-            if (!alive) return;
-            await playOnce(hand, "cover");
-            hand.visible = false;
-            if (!alive) return;
-            await playOnce(body, "camup");
-          } else {
-            await playOnce(body, "shaking_1coin");
-            if (!alive) return;
-            await playOnce(body, "reveal_1coin");
-            if (!alive) return;
-            await playOnce(body, "cover_1coin");
-          }
-        }
+        // ct_result_display_controller, step for step.
+        let animatingNewRound = false;
+        const animateNewRound = () => {
+          if (animatingNewRound) return;
+          animatingNewRound = true;
+          later(delays.shake, () => {
+            play(body, mode === 4 ? "shaking" : "shaking_1coin");
+            later(delays.idle, () => {
+              if (mode === 4) play(body, "idle", true);
+              animatingNewRound = false;
+            });
+          });
+        };
+
+        const animatePostClosedBet = () => {
+          const payout = delays.payout.reduce((sum, ms) => sum + ms, 0);
+          later(payout, () => {
+            if (mode === 4) play(hand, "cover");
+            else play(body, "cover_1coin");
+            later(delays.camUp, () => {
+              if (hand) hand.visible = false;
+              if (mode === 4) play(body, "camup");
+            });
+          });
+        };
+
+        const animateCloseBet = () => {
+          later(delays.camDown, () => {
+            if (mode === 4) play(body, "camDown");
+            later(delays.reveal, () => {
+              if (mode === 4) {
+                play(body, `result_${pickLayout()}`);
+                hand.visible = true;
+                play(hand, "reveal");
+              } else {
+                play(body, "reveal_1coin");
+              }
+              later(delays.postClose, animatePostClosedBet);
+            });
+          });
+        };
+
+        unsubscribe.push(clock.on("startedBet", animateNewRound));
+        unsubscribe.push(clock.on("closedBet", animateCloseBet));
+        if (onReadyRef.current) onReadyRef.current();
       } catch (err) {
         if (alive) setError(err && err.message ? err.message : String(err));
       }
@@ -282,22 +356,24 @@ export default function BowlAnim({ mode, result }) {
 
     return () => {
       alive = false;
+      timeouts.forEach((id) => clearTimeout(id));
+      timeouts.clear();
+      unsubscribe.forEach((off) => off());
       if (app) {
         app.destroy(true, { children: true, texture: false, baseTexture: false });
         app = null;
       }
     };
-  }, [mode, result]);
+  }, [mode, result, clock]);
 
   return (
-    <section className="w-full max-w-[828px]">
-      <p className="mb-2 text-center text-sm tracking-wide text-amber-100/80">
-        {mode === 1 ? "1 coin" : "4 coins"}
-      </p>
-      <div ref={hostRef} className="overflow-hidden rounded-xl bg-[#1a3d32]" />
+    <div className="relative h-full w-full">
+      <div ref={hostRef} className="h-full w-full" />
       {error ? (
-        <p className="mt-2 text-center text-sm text-red-300">{error}</p>
+        <p className="absolute inset-x-0 top-2 text-center text-sm text-red-300">
+          {error}
+        </p>
       ) : null}
-    </section>
+    </div>
   );
 }
